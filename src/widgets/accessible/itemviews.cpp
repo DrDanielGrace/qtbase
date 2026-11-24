@@ -536,13 +536,13 @@ int QAccessibleTable::childCount() const
 int QAccessibleTable::indexOfChild(const QAccessibleInterface *iface) const
 {
     const QAbstractItemView *theView = view();
-    if (!theView)
+    if (!theView || !iface)
         return -1;
     const QAbstractItemModel *theModel = theView->model();
     if (!theModel)
         return -1;
     QAccessibleInterface *parent = iface->parent();
-    if (parent->object() != theView)
+    if (!parent || parent->object() != theView)
         return -1;
 
     const QModelIndex rootIndex = theView->rootIndex();
@@ -648,11 +648,22 @@ void QAccessibleTable::modelChange(QAccessibleTableModelChangeEvent *event)
     if (childToId.isEmpty())
         return;
 
+    // DataChanged does not rebuild the child cache.
+    if (event->modelChangeType() == QAccessibleTableModelChangeEvent::DataChanged)
+        return;
+
+    // deleteAccessibleInterface() sends a synchronous ObjectDestroyed event.
+    // The platform accessibility backend can re-enter QAccessibleTable::child()
+    // while that event is delivered, which inserts into childToId. Snapshot the
+    // old entries and clear the live map before deleting anything, so that the
+    // iteration can never observe a mutated/rehashed container.
+    const ChildCache oldCache = childToId;
+    childToId.clear();
+
     switch (event->modelChangeType()) {
     case QAccessibleTableModelChangeEvent::ModelReset:
-        for (QAccessible::Id id : std::as_const(childToId))
+        for (QAccessible::Id id : oldCache)
             QAccessible::deleteAccessibleInterface(id);
-        childToId.clear();
         break;
 
     // rows are inserted: move every row after that
@@ -661,13 +672,11 @@ void QAccessibleTable::modelChange(QAccessibleTableModelChangeEvent *event)
         int newRows = event->lastRow() - event->firstRow() + 1;
         int newColumns = event->lastColumn() - event->firstColumn() + 1;
 
-        ChildCache newCache;
-        ChildCache::ConstIterator iter = childToId.constBegin();
-
-        while (iter != childToId.constEnd()) {
+        for (auto iter = oldCache.constBegin(); iter != oldCache.constEnd(); ++iter) {
             QAccessible::Id id = iter.value();
             QAccessibleInterface *iface = QAccessible::accessibleInterface(id);
-            Q_ASSERT(iface);
+            if (!iface) // may have been deleted re-entrantly
+                continue;
             if (event->modelChangeType() == QAccessibleTableModelChangeEvent::RowsInserted
                 && iface->role() == QAccessible::RowHeader) {
                 QAccessibleTableHeaderCell *cell = static_cast<QAccessibleTableHeaderCell*>(iface);
@@ -681,17 +690,16 @@ void QAccessibleTable::modelChange(QAccessibleTableModelChangeEvent *event)
                     cell->index += newColumns;
                 }
             }
-            if (indexOfChild(iface) >= 0) {
-                newCache.insert(indexOfChild(iface), id);
+            const int index = indexOfChild(iface);
+            if (index >= 0) {
+                childToId.insert(index, id);
             } else {
                 // ### This should really not happen,
                 // but it might if the view has a root index set.
                 // This needs to be fixed.
                 QAccessible::deleteAccessibleInterface(id);
             }
-            ++iter;
         }
-        childToId = newCache;
         break;
     }
 
@@ -699,28 +707,40 @@ void QAccessibleTable::modelChange(QAccessibleTableModelChangeEvent *event)
     case QAccessibleTableModelChangeEvent::RowsRemoved: {
         int deletedColumns = event->lastColumn() - event->firstColumn() + 1;
         int deletedRows = event->lastRow() - event->firstRow() + 1;
-        ChildCache newCache;
-        ChildCache::ConstIterator iter = childToId.constBegin();
-        while (iter != childToId.constEnd()) {
+        for (auto iter = oldCache.constBegin(); iter != oldCache.constEnd(); ++iter) {
             QAccessible::Id id = iter.value();
             QAccessibleInterface *iface = QAccessible::accessibleInterface(id);
-            Q_ASSERT(iface);
+            if (!iface) // may have been deleted re-entrantly
+                continue;
             if (iface->role() == QAccessible::Cell || iface->role() == QAccessible::ListItem) {
                 Q_ASSERT(iface->tableCellInterface());
                 QAccessibleTableCell *cell = static_cast<QAccessibleTableCell*>(iface->tableCellInterface());
                 // Since it is a QPersistentModelIndex, we only need to check if it is valid
-                if (cell->m_index.isValid())
-                    newCache.insert(indexOfChild(cell), id);
-                else
+                if (cell->m_index.isValid()) {
+                    const int index = indexOfChild(cell);
+                    if (index >= 0)
+                        childToId.insert(index, id);
+                    else
+                        QAccessible::deleteAccessibleInterface(id);
+                } else {
                     QAccessible::deleteAccessibleInterface(id);
+                }
             } else if (event->modelChangeType() == QAccessibleTableModelChangeEvent::RowsRemoved
                        && iface->role() == QAccessible::RowHeader) {
                 QAccessibleTableHeaderCell *cell = static_cast<QAccessibleTableHeaderCell*>(iface);
                 if (cell->index < event->firstRow()) {
-                    newCache.insert(indexOfChild(cell), id);
+                    const int index = indexOfChild(cell);
+                    if (index >= 0)
+                        childToId.insert(index, id);
+                    else
+                        QAccessible::deleteAccessibleInterface(id);
                 } else if (cell->index > event->lastRow()) {
                     cell->index -= deletedRows;
-                    newCache.insert(indexOfChild(cell), id);
+                    const int index = indexOfChild(cell);
+                    if (index >= 0)
+                        childToId.insert(index, id);
+                    else
+                        QAccessible::deleteAccessibleInterface(id);
                 } else {
                     QAccessible::deleteAccessibleInterface(id);
                 }
@@ -728,17 +748,23 @@ void QAccessibleTable::modelChange(QAccessibleTableModelChangeEvent *event)
                    && iface->role() == QAccessible::ColumnHeader) {
                 QAccessibleTableHeaderCell *cell = static_cast<QAccessibleTableHeaderCell*>(iface);
                 if (cell->index < event->firstColumn()) {
-                    newCache.insert(indexOfChild(cell), id);
+                    const int index = indexOfChild(cell);
+                    if (index >= 0)
+                        childToId.insert(index, id);
+                    else
+                        QAccessible::deleteAccessibleInterface(id);
                 } else if (cell->index > event->lastColumn()) {
                     cell->index -= deletedColumns;
-                    newCache.insert(indexOfChild(cell), id);
+                    const int index = indexOfChild(cell);
+                    if (index >= 0)
+                        childToId.insert(index, id);
+                    else
+                        QAccessible::deleteAccessibleInterface(id);
                 } else {
                     QAccessible::deleteAccessibleInterface(id);
                 }
             }
-            ++iter;
         }
-        childToId = newCache;
         break;
     }
 
@@ -874,13 +900,13 @@ int QAccessibleTree::rowCount() const
 int QAccessibleTree::indexOfChild(const QAccessibleInterface *iface) const
 {
     const QAbstractItemView *theView = view();
-    if (!theView)
+    if (!theView || !iface)
         return -1;
     const QAbstractItemModel *theModel = theView->model();
     if (!theModel)
         return -1;
     QAccessibleInterface *parent = iface->parent();
-    if (parent->object() != theView)
+    if (!parent || parent->object() != theView)
         return -1;
 
     if (iface->role() == QAccessible::TreeItem) {
